@@ -14,14 +14,18 @@ import os
 import sys
 import time
 import logging
+import threading
 import requests
-import concurrent.futures
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 from openai import OpenAI
 import pyotp
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
 
 # ================================
 # LOGGING
@@ -68,7 +72,6 @@ ATR_TARGET_MULT      = 2.0
 
 # Pipeline behaviour
 TOP_N              = int(os.getenv("TOP_N", "10"))        # signals to email
-MAX_WORKERS        = 1          # Angel One rate-limits concurrent token lookups — keep serial
 FETCH_DELAY        = 1.2        # seconds between each stock (stay under Angel One RPM limit)
 MIN_AVG_VOLUME     = 500_000    # skip stocks averaging < 500k daily volume
 OPENAI_DELAY       = 1.5        # seconds between OpenAI calls to avoid 429s
@@ -91,8 +94,9 @@ NSE_HEADERS = {
 # ================================
 # CAPABILITY FLAGS  (set after env validation)
 # ================================
-AI_ENABLED    = False   # set True in validate_env() if OPENAI_API_KEY is present
-EMAIL_ENABLED = False   # set True in validate_env() if Gmail creds are present
+AI_ENABLED    = False        # set True in validate_env() if OPENAI_API_KEY is present
+EMAIL_ENABLED = False        # set True in validate_env() if Gmail creds are present
+openai_client: "OpenAI | None" = None  # module-level client, initialised in validate_env()
 
 
 # ================================
@@ -104,7 +108,7 @@ def validate_env() -> None:
     OpenAI and Gmail are treated as optional delivery layers: missing creds
     disable that layer with a warning but never abort the pipeline.
     """
-    global AI_ENABLED, EMAIL_ENABLED
+    global AI_ENABLED, EMAIL_ENABLED, openai_client
 
     # --- Hard requirements: Angel One ---
     required = {
@@ -138,7 +142,8 @@ def validate_env() -> None:
                 max_tokens=1,
                 messages=[{"role": "user", "content": "hi"}],
             )
-            AI_ENABLED = True
+            AI_ENABLED    = True
+            openai_client = probe   # reuse — no need to instantiate again per stock
             log.info("OpenAI quota verified — AI analysis enabled.")
         except Exception as exc:
             err = str(exc)
@@ -220,21 +225,61 @@ def fetch_nifty50() -> list[dict]:
 
 def _nifty50_fallback() -> list[dict]:
     """Hardcoded Nifty 50 snapshot — used only if NSE API is unreachable."""
-    symbols = [
-        "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-        "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BPCL",
-        "BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
-        "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
-        "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
-        "INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
-        "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
-        "POWERGRID", "RELIANCE", "SBILIFE", "SHRIRAMFIN", "SBIN",
-        "SUNPHARMA", "TCS", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
-        "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+    stocks = [
+        ("ADANIENT",   "Adani Enterprises"),
+        ("ADANIPORTS",  "Adani Ports"),
+        ("APOLLOHOSP",  "Apollo Hospitals"),
+        ("ASIANPAINT",  "Asian Paints"),
+        ("AXISBANK",    "Axis Bank"),
+        ("BAJAJ-AUTO",  "Bajaj Auto"),
+        ("BAJFINANCE",  "Bajaj Finance"),
+        ("BAJAJFINSV",  "Bajaj Finserv"),
+        ("BEL",         "Bharat Electronics"),
+        ("BPCL",        "BPCL"),
+        ("BHARTIARTL",  "Bharti Airtel"),
+        ("BRITANNIA",   "Britannia"),
+        ("CIPLA",       "Cipla"),
+        ("COALINDIA",   "Coal India"),
+        ("DRREDDY",     "Dr. Reddy's"),
+        ("EICHERMOT",   "Eicher Motors"),
+        ("GRASIM",      "Grasim Industries"),
+        ("HCLTECH",     "HCL Technologies"),
+        ("HDFCBANK",    "HDFC Bank"),
+        ("HDFCLIFE",    "HDFC Life"),
+        ("HEROMOTOCO",  "Hero MotoCorp"),
+        ("HINDALCO",    "Hindalco"),
+        ("HINDUNILVR",  "Hindustan Unilever"),
+        ("ICICIBANK",   "ICICI Bank"),
+        ("ITC",         "ITC"),
+        ("INDUSINDBK",  "IndusInd Bank"),
+        ("INFY",        "Infosys"),
+        ("JSWSTEEL",    "JSW Steel"),
+        ("KOTAKBANK",   "Kotak Mahindra Bank"),
+        ("LT",          "Larsen & Toubro"),
+        ("M&M",         "Mahindra & Mahindra"),
+        ("MARUTI",      "Maruti Suzuki"),
+        ("NESTLEIND",   "Nestle India"),
+        ("NTPC",        "NTPC"),
+        ("ONGC",        "ONGC"),
+        ("POWERGRID",   "Power Grid"),
+        ("RELIANCE",    "Reliance Industries"),
+        ("SBILIFE",     "SBI Life Insurance"),
+        ("SHRIRAMFIN",  "Shriram Finance"),
+        ("SBIN",        "State Bank of India"),
+        ("SUNPHARMA",   "Sun Pharma"),
+        ("TCS",         "Tata Consultancy Services"),
+        ("TATACONSUM",  "Tata Consumer Products"),
+        ("TATAMOTORS",  "Tata Motors"),
+        ("TATASTEEL",   "Tata Steel"),
+        ("TECHM",       "Tech Mahindra"),
+        ("TITAN",       "Titan Company"),
+        ("TRENT",       "Trent"),
+        ("ULTRACEMCO",  "UltraTech Cement"),
+        ("WIPRO",       "Wipro"),
     ]
     return [
-        {"symbol": f"{s}-EQ", "exchange": "NSE", "name": s}
-        for s in symbols
+        {"symbol": f"{sym}-EQ", "exchange": "NSE", "name": name}
+        for sym, name in stocks
     ]
 
 
@@ -540,9 +585,8 @@ def analyze(stock_name: str, sig: dict, bt: dict) -> str:
     )
 
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
         time.sleep(OPENAI_DELAY)   # avoid OpenAI RPM rate limit across 50 stocks
-        res = client.chat.completions.create(
+        res = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             max_tokens=120,
             messages=[{"role": "user", "content": prompt}],
@@ -567,10 +611,10 @@ def analyze(stock_name: str, sig: dict, bt: dict) -> str:
 def process_stock(obj: SmartConnect, s: dict) -> dict | None:
     """
     Full pipeline for one stock: fetch → screen → indicators → signal → backtest → AI.
+    Backtest and AI analysis are skipped for HOLD signals to save compute time.
     Returns a result dict or None if the stock should be skipped.
-    Intended to run inside a ThreadPoolExecutor worker.
     """
-    time.sleep(FETCH_DELAY)   # throttle per-thread to respect API rate limits
+    time.sleep(FETCH_DELAY)   # throttle to respect Angel One API rate limits
 
     df = get_data(obj, s["symbol"], s["exchange"])
     if df is None:
@@ -584,10 +628,15 @@ def process_stock(obj: SmartConnect, s: dict) -> dict | None:
         return None
 
     sig = generate_signal(df, len(df) - 1)
-    bt  = backtest(df)
 
-    # analyze() always returns a string — never drops the stock row
-    analysis = analyze(s["name"], sig, bt)
+    # Skip expensive backtest + AI for HOLD signals — they won't make the top-N
+    # unless there are fewer than TOP_N actionable signals across all 50 stocks.
+    if sig["signal"] == "HOLD":
+        bt = {"net_return_pct": 0.0, "win_rate_pct": 0.0}
+        analysis = "HOLD — no actionable signal."
+    else:
+        bt       = backtest(df)
+        analysis = analyze(s["name"], sig, bt)
 
     log.info(
         f"{s['name']}: {sig['signal']} "
@@ -778,8 +827,8 @@ def send_email(results: list[dict]) -> bool:
             timeout=15,
         )
 
-        # Resend returns 200 with an id field on success
-        if resp.status_code == 200:
+        # Resend returns 200 or 201 on success
+        if resp.ok:
             log.info(f"Email sent to {EMAIL_RECIPIENT} via Resend ✓")
             return True
 
@@ -806,24 +855,20 @@ def run() -> None:
     stocks = fetch_nifty50()
 
     log.info(
-        f"Processing {len(stocks)} stocks with {MAX_WORKERS} workers…"
+        f"Processing {len(stocks)} stocks serially…"
     )
 
     all_results = []
 
-    # Concurrent fetch + process
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(process_stock, obj, s): s for s in stocks
-        }
-        for future in concurrent.futures.as_completed(futures):
-            s = futures[future]
-            try:
-                result = future.result()
-                if result:
-                    all_results.append(result)
-            except Exception as exc:
-                log.error(f"Unhandled error processing {s['name']}: {exc}")
+    # Serial loop — Angel One rate-limits concurrent requests so MAX_WORKERS=1
+    # is effectively serial anyway; a plain loop is simpler and easier to debug.
+    for s in stocks:
+        try:
+            result = process_stock(obj, s)
+            if result:
+                all_results.append(result)
+        except Exception as exc:
+            log.error(f"Unhandled error processing {s['name']}: {exc}")
 
     log.info(
         f"Processing complete — {len(all_results)}/{len(stocks)} stocks "
@@ -858,4 +903,132 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    # Set MODE=pipeline to run the pipeline once without the API server.
+    # Default (MODE=api) starts the FastAPI server.
+    mode = os.getenv("MODE", "api")
+    if mode == "pipeline":
+        run()
+    else:
+        port = int(os.getenv("PORT", "8000"))
+        log.info(f"Starting SignalEdge API on port {port}...")
+        uvicorn.run(app, host="0.0.0.0", port=port)
+
+# ================================
+# API SERVER  (FastAPI)
+# ================================
+import threading
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
+
+app = FastAPI(title="SignalEdge API", version="1.0")
+
+# Allow the PWA (any origin) to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# ── In-memory cache ──
+_cache: dict = {
+    "signals":  [],
+    "last_run": None,   # ISO timestamp of last completed run
+    "status":   "idle", # idle | running | done | error
+    "error":    None,
+}
+_cache_lock = threading.Lock()
+
+
+def _run_pipeline_bg() -> None:
+    """Run the full pipeline in a background thread and update the cache."""
+    with _cache_lock:
+        _cache["status"] = "running"
+        _cache["error"]  = None
+
+    try:
+        validate_env()
+        obj    = login()
+        stocks = fetch_nifty50()
+
+        all_results = []
+        for s in stocks:
+            try:
+                result = process_stock(obj, s)
+                if result:
+                    all_results.append(result)
+            except Exception as exc:
+                log.error(f"Error processing {s['name']}: {exc}")
+
+        top = top_n_signals(all_results, TOP_N)
+
+        if EMAIL_ENABLED:
+            send_email(top)
+
+        with _cache_lock:
+            _cache["signals"]  = top
+            _cache["last_run"] = datetime.now().isoformat()
+            _cache["status"]   = "done"
+            _cache["error"]    = None
+
+        log.info("Background pipeline run complete — cache updated.")
+
+    except Exception as exc:
+        log.error(f"Background pipeline failed: {exc}")
+        with _cache_lock:
+            _cache["status"] = "error"
+            _cache["error"]  = str(exc)
+
+
+@app.get("/")
+def root():
+    """Health check."""
+    return {"service": "SignalEdge API", "status": "ok"}
+
+
+@app.get("/signals")
+def get_signals():
+    """
+    Return the latest top-N signals from the cache.
+    Response shape matches exactly what the PWA expects.
+    """
+    with _cache_lock:
+        return JSONResponse({
+            "status":   _cache["status"],
+            "last_run": _cache["last_run"],
+            "count":    len(_cache["signals"]),
+            "signals":  _cache["signals"],
+        })
+
+
+@app.post("/run")
+def trigger_run(background_tasks: BackgroundTasks):
+    """
+    Trigger a fresh pipeline run in the background.
+    Returns immediately — poll GET /signals for results.
+    """
+    with _cache_lock:
+        if _cache["status"] == "running":
+            return JSONResponse(
+                {"message": "Pipeline already running. Poll /signals for updates."},
+                status_code=202,
+            )
+
+    background_tasks.add_task(_run_pipeline_bg)
+    return JSONResponse(
+        {"message": "Pipeline started. Poll GET /signals for results."},
+        status_code=202,
+    )
+
+
+@app.get("/status")
+def get_status():
+    """Quick status check — is the pipeline running?"""
+    with _cache_lock:
+        return {
+            "status":   _cache["status"],
+            "last_run": _cache["last_run"],
+            "error":    _cache["error"],
+        }
