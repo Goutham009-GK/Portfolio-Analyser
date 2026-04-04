@@ -14,13 +14,10 @@ import os
 import sys
 import time
 import logging
-import smtplib
 import requests
 import concurrent.futures
 import pandas as pd
 import pandas_ta as ta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
 from openai import OpenAI
@@ -48,10 +45,10 @@ ANGEL_PASSWORD    = os.getenv("ANGEL_PASSWORD", "")
 ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")   # required
 
-# Gmail SMTP — see README for setup instructions
-GMAIL_SENDER      = os.getenv("GMAIL_SENDER", "")         # your.email@gmail.com
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")  # 16-char app password
-EMAIL_RECIPIENT   = os.getenv("EMAIL_RECIPIENT", "")       # where to send the report
+# SendGrid email delivery (HTTPS — works on Railway free tier)
+SENDGRID_API_KEY  = os.getenv("SENDGRID_API_KEY", "")   # from sendgrid.com dashboard
+EMAIL_SENDER      = os.getenv("EMAIL_SENDER", "")        # verified sender in SendGrid
+EMAIL_RECIPIENT   = os.getenv("EMAIL_RECIPIENT", "")     # where to send the report
 
 # Trading parameters
 INITIAL_CAPITAL    = 100_000
@@ -134,16 +131,16 @@ def validate_env() -> None:
             "'Not available' in the report. Pipeline will still run."
         )
 
-    # --- Soft requirements: Gmail ---
-    if GMAIL_SENDER and GMAIL_APP_PASSWORD and EMAIL_RECIPIENT:
+    # --- Soft requirements: SendGrid ---
+    if SENDGRID_API_KEY and EMAIL_SENDER and EMAIL_RECIPIENT:
         EMAIL_ENABLED = True
-        log.info("Gmail enabled — report will be emailed.")
+        log.info("SendGrid enabled — report will be emailed.")
     else:
         missing_email = [
             k for k, v in {
-                "GMAIL_SENDER": GMAIL_SENDER,
-                "GMAIL_APP_PASSWORD": GMAIL_APP_PASSWORD,
-                "EMAIL_RECIPIENT": EMAIL_RECIPIENT,
+                "SENDGRID_API_KEY": SENDGRID_API_KEY,
+                "EMAIL_SENDER":     EMAIL_SENDER,
+                "EMAIL_RECIPIENT":  EMAIL_RECIPIENT,
             }.items() if not v
         ]
         log.warning(
@@ -730,35 +727,49 @@ def build_html_email(results: list[dict]) -> str:
 
 def send_email(results: list[dict]) -> bool:
     """
-    Send the HTML report via Gmail SMTP.
-    Uses TLS on port 587. Requires a Gmail App Password (not your account password).
+    Send the HTML report via SendGrid's HTTPS API (port 443).
+    Uses HTTPS — works on Railway free tier where SMTP port 587 is blocked.
+    Requires a free SendGrid account and a verified sender address.
     """
     try:
         date_str = datetime.now().strftime("%d %b %Y")
-        subject  = f"📈 Nifty 50 Signals — {date_str} (Top {len(results)})"
+        subject  = "Nifty 50 Signals — " + date_str + " (Top " + str(len(results)) + ")"
         html     = build_html_email(results)
 
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = GMAIL_SENDER
-        msg["To"]      = EMAIL_RECIPIENT
-        msg.attach(MIMEText(html, "html"))
+        payload = {
+            "personalizations": [
+                {
+                    "to": [{"email": EMAIL_RECIPIENT}],
+                    "subject": subject,
+                }
+            ],
+            "from":    {"email": EMAIL_SENDER},
+            "content": [{"type": "text/html", "value": html}],
+        }
 
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
-
-        log.info(f"Email sent to {EMAIL_RECIPIENT} ✓")
-        return True
-
-    except smtplib.SMTPAuthenticationError:
-        log.error(
-            "Gmail SMTP authentication failed. "
-            "Make sure you are using an App Password, not your account password. "
-            "Guide: https://support.google.com/accounts/answer/185833"
+        resp = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": "Bearer " + SENDGRID_API_KEY,
+                "Content-Type":  "application/json",
+            },
+            json=payload,
+            timeout=15,
         )
+
+        # SendGrid returns 202 Accepted on success (no body)
+        if resp.status_code == 202:
+            log.info(f"Email sent to {EMAIL_RECIPIENT} via SendGrid ✓")
+            return True
+
+        log.error(
+            f"SendGrid rejected the request — "
+            f"status {resp.status_code}: {resp.text[:300]}"
+        )
+        return False
+
+    except requests.exceptions.Timeout:
+        log.error("SendGrid request timed out after 15s.")
         return False
     except Exception as exc:
         log.error(f"Email send failed: {exc}")
