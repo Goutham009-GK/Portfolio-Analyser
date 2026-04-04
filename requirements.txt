@@ -1,0 +1,8 @@
+requests
+pandas
+pandas_ta
+pyotp
+openai
+smartapi-python
+logzero
+websocket-client
