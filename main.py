@@ -553,51 +553,41 @@ def build_html_email(results: list[dict]) -> str:
     rows = ""
 
     for r in results:
-        sig    = r["signal"]
-        color  = SIGNAL_COLOR.get(sig, "#6b7280")
-        bg     = SIGNAL_BG.get(sig, "#f9fafb")
-        emoji  = SIGNAL_EMOJI.get(sig, "●")
+        sig      = r["signal"]
+        color    = SIGNAL_COLOR.get(sig, "#6b7280")
+        bg       = SIGNAL_BG.get(sig, "#f9fafb")
+        emoji    = SIGNAL_EMOJI.get(sig, "●")
+        name     = r["name"]
+        symbol   = r["symbol"]
+        score    = r["score"]
+        entry    = r["entry"]
+        sl       = r["sl"]
+        target   = r["target"]
+        rsi      = r["rsi"]
+        analysis = r["analysis"]
 
-        rows += f"""
-        <tr style="background:{bg}; border-bottom:1px solid #e5e7eb;">
-          <td style="padding:14px 16px; font-weight:600; color:#111827;">
-            {r['name']}
-            <br><span style="font-size:11px; color:#6b7280; font-weight:400;">{r['symbol']}</span>
-          </td>
-          <td style="padding:14px 16px; text-align:center;">
-            <span style="
-              display:inline-block;
-              padding:4px 10px;
-              border-radius:9999px;
-              background:{color};
-              color:#fff;
-              font-size:12px;
-              font-weight:700;
-              letter-spacing:0.05em;
-            ">{emoji} {sig}</span>
-            <br><span style="font-size:11px; color:#6b7280;">score {r['score']}</span>
-          </td>
-          <td style="padding:14px 16px; text-align:right; font-family:monospace;">
-            ₹{r['entry']:,.2f}
-          </td>
-          <td style="padding:14px 16px; text-align:right; font-family:monospace; color:#dc2626;">
-            ₹{r['sl']:,.2f}
-          </td>
-          <td style="padding:14px 16px; text-align:right; font-family:monospace; color:#16a34a;">
-            ₹{r['target']:,.2f}
-          </td>
-          <td style="padding:14px 16px; text-align:center; color:#374151;">
-            {r['rsi']}
-          </td>
-          <td style="padding:14px 16px; font-size:12px; color:#374151; max-width:260px;">
-            {r['analysis']}
-          </td>
-        </tr>"""
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="margin:0; padding:
+        # All dynamic values extracted to local vars — no dict access or
+        # single quotes inside the f-string (compatible with Python 3.8+)
+        rows += (
+            '<tr style="background:' + bg + '; border-bottom:1px solid #e5e7eb;">'
+            '<td style="padding:14px 16px; font-weight:600; color:#111827;">'
+            + name +
+            '<br><span style="font-size:11px; color:#6b7280; font-weight:400;">' + symbol + "</span>"
+            "</td>"
+            '<td style="padding:14px 16px; text-align:center;">'
+            '<span style="display:inline-block; padding:4px 10px; border-radius:9999px;'
+            " background:" + color + '; color:#fff; font-size:12px; font-weight:700; letter-spacing:0.05em;">'
+            + emoji + " " + sig +
+            "</span>"
+            '<br><span style="font-size:11px; color:#6b7280;">score ' + str(score) + "</span>"
+            "</td>"
+            '<td style="padding:14px 16px; text-align:right; font-family:monospace;">'
+            + "&#8377;{:,.2f}".format(entry) +
+            "</td>"
+            '<td style="padding:14px 16px; text-align:right; font-family:monospace; color:#dc2626;">'
+            + "&#8377;{:,.2f}".format(sl) +
+            "</td>"
+            '<td style="padding:14px 16px; text-align:right; font-family:monospace; color:#16a34a;">'
+            + "&#8377;{:,.2f}".format(target) +
+            "</td>"
+            '<td 
