@@ -1,6 +1,0 @@
-requests
-pandas
-pandas_ta
-pyotp
-openai
-SmartApi-python
