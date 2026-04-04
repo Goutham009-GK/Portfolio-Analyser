@@ -1,84 +1,203 @@
 """
-Stock Analysis & Signal Pipeline v4.0
-──────────────────────────────────────
-Best of v2 + v3 merged:
-- Angel One SmartAPI for live data
-- Full technical indicators (pandas-ta)
-- Trend-filtered signal engine with TRUE MACD crossover detection
-- ATR-based entry / stop loss / targets
-- Position sizing (risk % of capital per trade)
-- Realistic backtester: SL/target on candle H/L, no overlap, brokerage
-- Full stats: win rate, Sharpe, profit factor, max drawdown, equity curve
-- AI analysis via GPT-4 (fixed API call) with full data context
-- WhatsApp delivery via CallMeBot (snapshot + full report)
-- Per-stock error handling so one failure doesn't crash the run
+================================
+STOCK PIPELINE V8.1 (PRODUCTION READY)
+================================
+Changes over V8:
+- OpenAI is now a required credential (pipeline exits at startup if missing)
+- openai imported at module level — no lazy import, no silent fallback
+- analyze() no longer has a fallback path; any API failure raises clearly
+- OPENAI_MODEL constant added for easy model switching
+================================
 """
 import os
+import sys
 import time
-import math
+import logging
+import smtplib
 import requests
+import concurrent.futures
 import pandas as pd
 import pandas_ta as ta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from SmartApi import SmartConnect
-import pyotp
 from openai import OpenAI
-# ─────────────────────────────────────────────────────
-# CONFIG — set all in Railway environment variables
-# ─────────────────────────────────────────────────────
-ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
-ANGEL_CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
-ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD")
-ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # GPT-4
-NEWS_API_KEY = os.getenv("NEWS_API_KEY") # newsapi.org free tier
-CALLMEBOT_PHONE = os.getenv("CALLMEBOT_PHONE") # e.g. 919876543210
-CALLMEBOT_APIKEY = os.getenv("CALLMEBOT_APIKEY")
-# ── Risk / backtest settings ──
-INITIAL_CAPITAL = 100000 # Rs 1 lakh starting capital for backtest
-RISK_PER_TRADE_PCT = 1.0 # Risk 1% of capital per trade
-STOP_LOSS_PCT = 2.0 # Fallback SL if ATR unavailable
-TARGET_PCT = 4.0 # Fallback target
-MAX_HOLD_DAYS = 10 # Max days to hold before forced exit
-BROKERAGE_PCT = 0.05 # 0.05% per side
-# ── Stocks to analyze ──
-STOCKS = [
-{"symbol": "HDFCBANK-EQ", "exchange": "NSE", "name": "HDFC Bank"},
-{"symbol": "RELIANCE-EQ", "exchange": "NSE", "name": "Reliance Industries"},
-{"symbol": "TCS-EQ", "exchange": "NSE", "name": "TCS"},
-{"symbol": "INFY-EQ", "exchange": "NSE", "name": "Infosys"},
-]
-# Token fallback map (used if searchScrip fails)
-TOKEN_MAP = {
-"HDFCBANK-EQ": "1333",
-"RELIANCE-EQ": "2885",
-"TCS-EQ": "11536",
-"INFY-EQ": "1594",
-"ICICIBANK-EQ": "4963",
-"SBIN-EQ": "3045",
+import pyotp
+# ================================
+# LOGGING
+# ================================
+logging.basicConfig(
+level=logging.INFO,
+format="%(asctime)s [%(levelname)s] %(message)s",
+handlers=[
+logging.FileHandler("pipeline.log"),
+logging.StreamHandler(),
+],
+)
+log = logging.getLogger(__name__)
+# ================================
+# CONFIG
+# ================================
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
+ANGEL_CLIENT_ID = os.getenv("ANGEL_CLIENT_ID", "")
+ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD", "")
+ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") # required
+# Gmail SMTP — see README for setup instructions
+GMAIL_SENDER = os.getenv("GMAIL_SENDER", "") # your.email@gmail.com
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "") # 16-char app password
+EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "") # where to send the report
+# Trading parameters
+INITIAL_CAPITAL = 100_000
+RISK_PER_TRADE_PCT = 1.0
+MAX_HOLD_DAYS = 10
+BROKERAGE_PCT = 0.05 # per leg
+MAX_POSITION_PCT = 20.0
+# OpenAI
+OPENAI_MODEL = "gpt-4o" # swap to "gpt-4o-mini" to reduce cost
+# Signal thresholds
+BUY_SCORE_THRESHOLD = 4
+SELL_SCORE_THRESHOLD = -4
+ATR_SL_MULT = 1.5
+ATR_TARGET_MULT = 2.0
+# Pipeline behaviour
+TOP_N = int(os.getenv("TOP_N", "10")) # signals to email
+MAX_WORKERS = 5 # concurrent fetch threads
+FETCH_DELAY = 0.5 # seconds between fetches per thread (rate-limit guard)
+MIN_AVG_VOLUME = 500_000 # skip stocks averaging < 500k daily volume
+# NSE Nifty 50 index endpoint (public, no auth needed)
+NIFTY50_URL = (
+"https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
+)
+NSE_HEADERS = {
+"User-Agent": (
+"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+"AppleWebKit/537.36 (KHTML, like Gecko) "
+"Chrome/120.0.0.0 Safari/537.36"
+),
+"Accept-Language": "en-US,en;q=0.9",
+"Referer": "https://www.nseindia.com/",
 }
-# ═══════════════════════════════════════════════════
-# 1. LOGIN
-# ═══════════════════════════════════════════════════
-def login():
-print("Logging into Angel One...")
+# ================================
+# STARTUP VALIDATION
+# ================================
+def validate_env() -> None:
+"""Fail fast if any required credential is missing."""
+required = {
+"ANGEL_API_KEY": ANGEL_API_KEY,
+"ANGEL_CLIENT_ID": ANGEL_CLIENT_ID,
+"ANGEL_PASSWORD": ANGEL_PASSWORD,
+"ANGEL_TOTP_SECRET": ANGEL_TOTP_SECRET,
+"OPENAI_API_KEY": OPENAI_API_KEY,
+"GMAIL_SENDER": GMAIL_SENDER,
+"GMAIL_APP_PASSWORD": GMAIL_APP_PASSWORD,
+"EMAIL_RECIPIENT": EMAIL_RECIPIENT,
+}
+missing = [k for k, v in required.items() if not v]
+if missing:
+log.critical(
+f"STARTUP FAILED — missing required env vars: {', '.join(missing)}. "
+"Set them before running."
+)
+sys.exit(1)
+# ================================
+# NIFTY 50 UNIVERSE (live from NSE)
+# ================================
+def fetch_nifty50() -> list[dict]:
+"""
+Fetch the current Nifty 50 constituents from NSE.
+Returns a list of dicts: {"symbol": "HDFCBANK-EQ", "exchange": "NSE", "name": "HDFC Bank"}
+Falls back to a hardcoded snapshot (April 2025) if the request fails.
+"""
+try:
+# NSE requires a session cookie — get one via the homepage first
+session = requests.Session()
+session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
+resp = session.get(NIFTY50_URL, headers=NSE_HEADERS, timeout=10)
+resp.raise_for_status()
+data = resp.json().get("data", [])
+stocks = []
+for item in data:
+sym = item.get("symbol", "").strip()
+name = item.get("meta", {}).get("companyName", sym)
+if sym and sym != "NIFTY 50": # first row is the index itself
+stocks.append({
+"symbol": f"{sym}-EQ",
+"exchange": "NSE",
+"name": name,
+})
+if len(stocks) < 40:
+raise ValueError(f"Only {len(stocks)} stocks returned — suspiciously low.")
+log.info(f"Nifty 50 universe loaded: {len(stocks)} stocks.")
+return stocks
+except Exception as exc:
+log.warning(
+f"Live Nifty 50 fetch failed ({exc}). "
+"Using hardcoded April-2025 snapshot as fallback."
+)
+return _nifty50_fallback()
+def _nifty50_fallback() -> list[dict]:
+"""Hardcoded Nifty 50 snapshot — used only if NSE API is unreachable."""
+symbols = [
+"ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+"BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BPCL",
+"BHARTIARTL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
+"EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+"HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
+"INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
+"M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+"POWERGRID", "RELIANCE", "SBILIFE", "SHRIRAMFIN", "SBIN",
+"SUNPHARMA", "TCS", "TATACONSUM", "TATAMOTORS", "TATASTEEL",
+"TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+]
+return [
+{"symbol": f"{s}-EQ", "exchange": "NSE", "name": s}
+for s in symbols
+]
+# ================================
+# LOGIN
+# ================================
+def login() -> SmartConnect:
+try:
 totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
 obj = SmartConnect(api_key=ANGEL_API_KEY)
 data = obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp)
 if not data.get("status"):
-raise Exception(f"Login failed: {data}")
-print("Login successful")
+raise RuntimeError(
+f"Angel One session creation failed — API response: {data}"
+)
+log.info("Angel One login successful.")
 return obj
-# ═══════════════════════════════════════════════════
-# 2. DATA
-# ═══════════════════════════════════════════════════
-def get_token(obj, symbol, exchange):
+except Exception as exc:
+log.critical(f"Login failed — cannot continue: {exc}")
+raise
+# ================================
+# SYMBOL TOKEN LOOKUP
+# ================================
+def get_token(obj: SmartConnect, symbol: str, exchange: str) -> str | None:
 try:
-return obj.searchScrip(exchange, symbol)["data"][0]["symboltoken"]
-except:
-return TOKEN_MAP.get(symbol, "")
-def get_data(obj, symbol, exchange="NSE", days=300):
+resp = obj.searchScrip(exchange, symbol)
+if resp and resp.get("data"):
+return resp["data"][0]["symboltoken"]
+log.warning(f"No token found for {symbol} on {exchange}.")
+return None
+except Exception as exc:
+log.error(f"Token lookup failed for {symbol}: {exc}")
+return None
+# ================================
+# DATA FETCH (retry + backoff)
+# ================================
+def get_data(
+obj: SmartConnect,
+symbol: str,
+exchange: str = "NSE",
+days: int = 300,
+retries: int = 3,
+) -> pd.DataFrame | None:
 token = get_token(obj, symbol, exchange)
+if not token:
+return None
 params = {
 "exchange": exchange,
 "symboltoken": token,
@@ -86,440 +205,450 @@ params = {
 "fromdate": (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
 "todate": datetime.now().strftime("%Y-%m-%d %H:%M"),
 }
+for attempt in range(1, retries + 1):
+try:
 data = obj.getCandleData(params)
-df = pd.DataFrame(data["data"], columns=["ts","open","high","low","close","volume"])
+if not data or "data" not in data or not data["data"]:
+raise ValueError("getCandleData returned empty response.")
+df = pd.DataFrame(
+data["data"],
+columns=["ts", "open", "high", "low", "close", "volume"],
+)
 df["ts"] = pd.to_datetime(df["ts"])
+if len(df) < 50:
+raise ValueError(f"Only {len(df)} rows — need ≥ 50.")
 return df.sort_values("ts").reset_index(drop=True)
-# ═══════════════════════════════════════════════════
-# 3. INDICATORS
-# ═══════════════════════════════════════════════════
-def add_indicators(df):
-c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
-# Momentum
+except Exception as exc:
+wait = 2 ** attempt
+if attempt < retries:
+log.warning(
+f"Fetch attempt {attempt}/{retries} failed for {symbol}: "
+f"{exc}. Retrying in {wait}s…"
+)
+time.sleep(wait)
+else:
+log.error(f"All {retries} fetch attempts failed for {symbol}: {exc}")
+return None
+# ================================
+# VOLUME PRE-SCREEN
+# ================================
+def passes_volume_screen(df: pd.DataFrame, symbol: str) -> bool:
+"""
+Skip stocks whose 20-day average volume is below MIN_AVG_VOLUME.
+Avoids generating signals on illiquid names where execution is unreliable.
+"""
+avg_vol = df["volume"].tail(20).mean()
+if avg_vol < MIN_AVG_VOLUME:
+log.info(
+f"Skipping {symbol} — avg 20-day volume "
+f"{avg_vol:,.0f} < {MIN_AVG_VOLUME:,}."
+)
+return False
+return True
+# ================================
+# INDICATORS
+# ================================
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
+try:
+c, h, l = df["close"], df["high"], df["low"]
 df["rsi"] = ta.rsi(c, length=14)
 macd = ta.macd(c)
-df["macd"] = macd["MACD_12_26_9"]
-df["macd_sig"] = macd["MACDs_12_26_9"]
-df["macd_hist"]= macd["MACDh_12_26_9"]
-stoch = ta.stoch(h, l, c)
-df["stoch_k"] = stoch["STOCHk_14_3_3"]
-df["stoch_d"] = stoch["STOCHd_14_3_3"]
-# Trend
-df["ma20"] = c.rolling(20).mean()
-df["ma50"] = c.rolling(50).mean()
-df["ma200"] = c.rolling(200).mean()
+df["macd_hist"] = macd["MACDh_12_26_9"]
+df["macd_line"] = macd["MACD_12_26_9"]
 df["ema9"] = ta.ema(c, length=9)
 df["ema21"] = ta.ema(c, length=21)
-# Volatility
-bb = ta.bbands(c, length=20)
-df["bb_upper"] = bb["BBU_20_2.0"]
-df["bb_mid"] = bb["BBM_20_2.0"]
-df["bb_lower"] = bb["BBL_20_2.0"]
+df["ma200"] = c.rolling(200).mean()
 df["atr"] = ta.atr(h, l, c, length=14)
-# Volume
-df["vol_avg20"] = v.rolling(20).mean()
-df["vol_ratio"] = v / df["vol_avg20"]
-return df.dropna().reset_index(drop=True)
-# ═══════════════════════════════════════════════════
-# 4. SIGNAL ENGINE
-# — trend-filtered RSI (v2)
-# — TRUE MACD crossover detection (v3 fix)
-# — ATR-based levels (v3)
-# — position sizing (v3)
-# ═══════════════════════════════════════════════════
-def generate_signal(df, i):
+df = df.dropna().reset_index(drop=True)
+if df.empty:
+raise ValueError("Empty after dropna.")
+return df
+except Exception as exc:
+log.error(f"Indicator computation failed: {exc}")
+return None
+# ================================
+# SIGNAL ENGINE
+# ================================
+def generate_signal(df: pd.DataFrame, i: int) -> dict:
+if i < 1 or i >= len(df):
+return {
+"signal": "HOLD", "score": 0,
+"entry": 0.0, "sl": 0.0, "target": 0.0,
+"atr": 0.0, "rsi": 50.0,
+}
 row = df.iloc[i]
 prev = df.iloc[i - 1]
 score = 0
-reasons = []
-in_uptrend = row.close > row.ma200 and row.ma50 > row.ma200
-in_downtrend = row.close < row.ma200 and row.ma50 < row.ma200
-# ── Trend ──
-if in_uptrend:
+# Trend (mutually exclusive)
+if row.close > row.ma200:
 score += 2
-reasons.append("Uptrend: price above MA200, MA50 > MA200")
-elif in_downtrend:
+elif row.close < row.ma200:
 score -= 2
-reasons.append("Downtrend: price below MA200")
-# ── RSI — trend-aware (v2 logic) ──
-if in_uptrend and 40 <= row.rsi <= 55:
-score += 2
-reasons.append(f"RSI pullback in uptrend ({row.rsi:.1f}) — good entry")
-elif in_uptrend and row.rsi < 40:
-score += 1
-reasons.append(f"RSI oversold in uptrend ({row.rsi:.1f}) — bounce possible")
-elif row.rsi > 70:
-score -= 2
-reasons.append(f"RSI overbought ({row.rsi:.1f})")
-elif in_downtrend and row.rsi < 30:
-score -= 1
-reasons.append(f"RSI oversold in downtrend ({row.rsi:.1f}) — falling knife risk")
-# ── TRUE MACD crossover (v3 fix — checks previous bar) ──
-if prev.macd_hist < 0 and row.macd_hist > 0:
+# MACD histogram crossover (one event at a time)
+if prev.macd_hist <= 0 and row.macd_hist > 0:
 score += 3
-reasons.append("Bullish MACD crossover (confirmed this bar)")
-elif prev.macd_hist > 0 and row.macd_hist < 0:
+elif prev.macd_hist >= 0 and row.macd_hist < 0:
 score -= 3
-reasons.append("Bearish MACD crossover (confirmed this bar)")
-elif row.macd_hist > 0:
-score += 1
-reasons.append("MACD histogram positive (bullish momentum)")
-else:
-score -= 1
-reasons.append("MACD histogram negative (bearish momentum)")
-# ── EMA short-term ──
+# Short-term trend (mutually exclusive)
 if row.ema9 > row.ema21:
 score += 1
-reasons.append("EMA9 > EMA21 (short-term bullish)")
-else:
+elif row.ema9 < row.ema21:
 score -= 1
-reasons.append("EMA9 < EMA21 (short-term bearish)")
-# ── Bollinger Band position ──
-bb_range = row.bb_upper - row.bb_lower
-if bb_range > 0:
-bb_pos = (row.close - row.bb_lower) / bb_range
-if bb_pos < 0.2 and in_uptrend:
+# RSI
+if row.rsi > 70:
+score -= 1
+elif row.rsi < 30:
 score += 1
-reasons.append("Near BB lower in uptrend — bounce zone")
-elif bb_pos > 0.85:
-score -= 1
-reasons.append("Near BB upper band — extended")
-# ── Volume ──
-if row.vol_ratio > 1.5:
-score += 1
-reasons.append(f"High volume ({row.vol_ratio:.1f}x avg) — strong conviction")
-elif row.vol_ratio < 0.6:
-score -= 1
-reasons.append("Low volume — weak move")
-# ── Stochastic ──
-if row.stoch_k < 20 and row.stoch_k > row.stoch_d and in_uptrend:
-score += 1
-reasons.append("Stochastic bullish crossover in oversold zone")
-elif row.stoch_k > 80:
-score -= 1
-reasons.append("Stochastic overbought")
-# ── Signal ──
-if score >= 6:
-signal = "STRONG BUY"
-elif score >= 3:
+if score >= BUY_SCORE_THRESHOLD:
 signal = "BUY"
-elif score <= -6:
-signal = "STRONG SELL"
-elif score <= -3:
+elif score <= SELL_SCORE_THRESHOLD:
 signal = "SELL"
 else:
 signal = "HOLD"
-# Capped confidence
-confidence = round(min((abs(score) / 12) * 100, 90), 1)
-# ATR-based levels
-atr = row.atr if not math.isnan(row.atr) else row.close * 0.015
-entry = round(row.close, 2)
-stop_loss = round(entry - 1.5 * atr, 2)
-target_1 = round(entry + 2.0 * atr, 2)
-target_2 = round(entry + 3.0 * atr, 2)
-rr = round((target_1 - entry) / max(entry - stop_loss, 0.01), 2)
+atr = float(row.atr)
+close = float(row.close)
 return {
 "signal": signal,
 "score": score,
-"confidence": confidence,
-"entry": entry,
-"stop_loss": stop_loss,
-"target_1": target_1,
-"target_2": target_2,
-"risk_reward": rr,
-"reasons": reasons,
+"entry": round(close, 2),
+"sl": round(close - ATR_SL_MULT * atr, 2),
+"target": round(close + ATR_TARGET_MULT * atr, 2),
 "atr": round(atr, 2),
+"rsi": round(float(row.rsi), 1),
 }
-# ── Position sizing (v3) ──
-def position_size(capital, entry, stop_loss):
-risk_amount = capital * (RISK_PER_TRADE_PCT / 100)
-per_share_risk = abs(entry - stop_loss)
-if per_share_risk == 0:
+# ================================
+# POSITION SIZING
+# ================================
+def calc_position_size(capital: float, entry: float, sl: float) -> int:
+per_share = entry - sl
+if per_share <= 0:
 return 0
-return int(risk_amount / per_share_risk)
-# ═══════════════════════════════════════════════════
-# 5. REALISTIC BACKTESTER
-# — enters at next day open (no look-ahead bias)
-# — checks SL on candle low, target on candle high
-# — proper position sizing applied
-# — brokerage deducted both sides
-# — full stats: win rate, Sharpe, profit factor, max DD
-# ═══════════════════════════════════════════════════
-def backtest(df):
+risk_qty = int((capital * RISK_PER_TRADE_PCT / 100) / per_share)
+cap_qty = int((capital * MAX_POSITION_PCT / 100) / entry)
+return min(risk_qty, cap_qty)
+# ================================
+# BACKTEST (used internally; results NOT included in email)
+# ================================
+def backtest(df: pd.DataFrame) -> dict:
 capital = float(INITIAL_CAPITAL)
-equity_curve = []
+peak = capital
+max_dd = 0.0
 trades = []
-i = 50
-while i < len(df) - MAX_HOLD_DAYS - 1:
+gross_win = gross_loss = 0.0
+for i in range(max(50, 1), len(df) - 1):
 sig = generate_signal(df, i)
-if sig["signal"] not in ["BUY", "STRONG BUY"]:
-equity_curve.append(capital)
-i += 1
+if sig["signal"] != "BUY":
 continue
-entry_price = df.iloc[i + 1]["open"]
-sl_price = entry_price * (1 - STOP_LOSS_PCT / 100)
-tgt_price = entry_price * (1 + TARGET_PCT / 100)
-qty = position_size(capital, entry_price, sl_price)
+entry = float(df.iloc[i + 1]["open"])
+atr = sig["atr"]
+sl = round(entry - ATR_SL_MULT * atr, 2)
+target = round(entry + ATR_TARGET_MULT * atr, 2)
+qty = calc_position_size(capital, entry, sl)
 if qty == 0:
-i += 1
 continue
-brokerage = entry_price * qty * (BROKERAGE_PCT / 100) * 2
 exit_price = None
-exit_reason = "MAX_HOLD"
-hold_days = 0
 for j in range(1, MAX_HOLD_DAYS + 1):
-if i + 1 + j >= len(df):
+idx = i + 1 + j
+if idx >= len(df):
+exit_price = float(df.iloc[-1]["close"])
 break
-candle = df.iloc[i + 1 + j]
-hold_days = j
-if candle["low"] <= sl_price:
-exit_price = sl_price
-exit_reason = "STOP_LOSS"
+candle = df.iloc[idx]
+if float(candle["open"]) < sl:
+exit_price = float(candle["open"])
 break
-if candle["high"] >= tgt_price:
-exit_price = tgt_price
-exit_reason = "TARGET"
+if float(candle["low"]) <= sl:
+exit_price = sl
+break
+if float(candle["high"]) >= target:
+exit_price = target
 break
 if exit_price is None:
-exit_price = df.iloc[min(i + 1 + MAX_HOLD_DAYS, len(df)-1)]["close"]
-pnl = (exit_price - entry_price) * qty - brokerage
-pnl_pct = (exit_price - entry_price) / entry_price * 100
+final_idx = min(i + 1 + MAX_HOLD_DAYS, len(df) - 1)
+exit_price = float(df.iloc[final_idx]["close"])
+brokerage = (entry + exit_price) * qty * (BROKERAGE_PCT / 100)
+pnl = (exit_price - entry) * qty - brokerage
 capital += pnl
-trades.append({
-"pnl": round(pnl, 2),
-"pnl_pct": round(pnl_pct, 3),
-"exit_reason":exit_reason,
-"hold_days": hold_days,
-})
-equity_curve.append(capital)
-i += hold_days + 1
-if not trades:
-return {"error": "No trades generated"}
-df_t = pd.DataFrame(trades)
-wins = df_t[df_t["pnl"] > 0]
-losses = df_t[df_t["pnl"] <= 0]
-# Max drawdown
-eq = pd.Series(equity_curve)
-rollmax= eq.cummax()
-max_dd = round(((eq - rollmax) / rollmax * 100).min(), 2)
-# Sharpe (annualised, using % returns)
-mean_r = df_t["pnl_pct"].mean()
-std_r = df_t["pnl_pct"].std()
-sharpe = round((mean_r / std_r) * (252 ** 0.5), 2) if std_r > 0 else 0
-# Profit factor
-gp = wins["pnl"].sum()
-gl = abs(losses["pnl"].sum())
-pf = round(gp / gl, 2) if gl > 0 else 99.0
+trades.append(pnl)
+gross_win += max(pnl, 0)
+gross_loss += abs(min(pnl, 0))
+if capital > peak:
+peak = capital
+dd = (peak - capital) / peak * 100
+if dd > max_dd:
+max_dd = dd
+total = len(trades)
+wins = sum(1 for p in trades if p > 0)
 return {
-"initial_capital": INITIAL_CAPITAL,
 "final_capital": round(capital, 2),
-"total_return_pct": round((capital - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100, 2),
-"total_trades": len(trades),
-"win_rate": round(len(wins) / len(trades) * 100, 1),
-"avg_pnl_pct": round(df_t["pnl_pct"].mean(), 3),
-"avg_win_pct": round(wins["pnl_pct"].mean(), 3) if len(wins) > 0 else 0,
-"avg_loss_pct": round(losses["pnl_pct"].mean(), 3) if len(losses) > 0 else 0,
-"profit_factor": pf,
-"sharpe_ratio": sharpe,
-"max_drawdown_pct": max_dd,
-"target_hits": len(df_t[df_t["exit_reason"] == "TARGET"]),
-"sl_hits": len(df_t[df_t["exit_reason"] == "STOP_LOSS"]),
-"avg_hold_days": round(df_t["hold_days"].mean(), 1),
+"trades": total,
+"win_rate_pct": round(wins / total * 100, 1) if total else 0.0,
+"avg_pnl": round(sum(trades) / total, 2) if total else 0.0,
+"net_return_pct": round((capital - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100, 2),
+"max_drawdown_pct": round(max_dd, 2),
+"profit_factor": round(gross_win / gross_loss, 2) if gross_loss else None,
 }
-def interpret_backtest(bt):
-wr = bt.get("win_rate", 0)
-pf = bt.get("profit_factor", 0)
-sr = bt.get("sharpe_ratio", 0)
-dd = bt.get("max_drawdown_pct", 0)
-if wr >= 55 and pf >= 1.5 and sr >= 1.0:
-return "Strategy looks VIABLE based on historical data"
-elif wr >= 45 and pf >= 1.2:
-return "Strategy shows MODERATE promise — validate further"
-else:
-return "Strategy needs improvement before live use"
-# ═══════════════════════════════════════════════════
-# 6. NEWS
-# ═══════════════════════════════════════════════════
-def fetch_news(stock_name, max_articles=6):
-if not NEWS_API_KEY:
-return ["NewsAPI key not configured"]
-try:
-r = requests.get("https://newsapi.org/v2/everything", params={
-"q": f"{stock_name} NSE India stock",
-"language": "en",
-"sortBy": "publishedAt",
-"pageSize": max_articles,
-"apiKey": NEWS_API_KEY,
-}, timeout=10)
-articles = r.json().get("articles", [])
-return [
-f"[{a.get('publishedAt','')[:10]}] {a.get('title','')} — {(a.get('description','')
-or '')[:100]}"
-for a in articles
-] or ["No recent news found"]
-except Exception as e:
-return [f"News error: {e}"]
-# ═══════════════════════════════════════════════════
-# 7. GPT-4 ANALYSIS (FIXED API CALL)
-# — full data context injected (not just signal+return)
-# — correct: client.chat.completions.create
-# — NOT client.responses.create (that was v3's bug)
-# ═══════════════════════════════════════════════════
-def analyze_with_gpt(stock_name, row, sig, bt, news_items):
-client = OpenAI(api_key=OPENAI_API_KEY)
-news_text = "\n".join([f" {i+1}. {n}" for i, n in enumerate(news_items)])
-verdict = interpret_backtest(bt)
-qty = position_size(INITIAL_CAPITAL, sig["entry"], sig["stop_loss"])
-prompt = f"""
-You are a world-class equity research analyst and technical analyst.
-Analyze {stock_name} using the LIVE DATA below. Use ONLY this data for technical analysis.
-LIVE TECHNICAL DATA:
-Price: Rs{row.close:.2f}
-MA20: Rs{row.ma20:.2f} | MA50: Rs{row.ma50:.2f} | MA200: Rs{row.ma200:.2f}
-EMA9: Rs{row.ema9:.2f} | EMA21: Rs{row.ema21:.2f}
-RSI: {row.rsi:.1f} | MACD hist: {row.macd_hist:.4f} ({'bullish' if row.macd_hist > 0 else
-'bearish'})
-Stochastic K/D: {row.stoch_k:.1f}/{row.stoch_d:.1f}
-BB: Rs{row.bb_upper:.2f} / Rs{row.bb_mid:.2f} / Rs{row.bb_lower:.2f}
-ATR: Rs{row.atr:.2f} | Volume ratio: {row.vol_ratio:.2f}x avg
-SIGNAL:
-Signal: {sig['signal']} | Score: {sig['score']} | Confidence: {sig['confidence']}%
-Entry: Rs{sig['entry']} | Stop Loss: Rs{sig['stop_loss']}
-Target 1: Rs{sig['target_1']} | Target 2: Rs{sig['target_2']}
-Risk/Reward: {sig['risk_reward']}:1 | ATR: Rs{sig['atr']}
-Position size (on Rs1L capital, 1% risk): {qty} shares
-Reasons: {' | '.join(sig['reasons'])}
-BACKTEST (300 days, SL={STOP_LOSS_PCT}%, Target={TARGET_PCT}%, max {MAX_HOLD_DAYS}d hold):
-Trades: {bt.get('total_trades')} | Win Rate: {bt.get('win_rate')}%
-Profit Factor: {bt.get('profit_factor')} | Sharpe: {bt.get('sharpe_ratio')}
-Max Drawdown: {bt.get('max_drawdown_pct')}% | Avg Hold: {bt.get('avg_hold_days')} days
-Total Return: {bt.get('total_return_pct')}% on Rs{INITIAL_CAPITAL:,}
-Interpretation: {verdict}
-LATEST NEWS:
-{news_text}
-Write a structured analysis with these sections:
-1. TECHNICAL ANALYSIS
-- Interpret each indicator precisely
-- Confirm or challenge the {sig['signal']} signal
-- Validate entry/SL/targets
-- 3-sentence technical summary
-2. BACKTEST INTERPRETATION
-- Is this strategy historically reliable for {stock_name}?
-- Interpret win rate, profit factor, Sharpe, drawdown
-- Position sizing advice: is {qty} shares appropriate?
-3. FUNDAMENTAL SNAPSHOT
-- Business model, moat (label as approximate/general knowledge)
-- Valuation context vs sector
-- Bull case vs Bear case
-- 1-3 month outlook
-4. NEWS SENTIMENT
-- Summarize each news item
-- Mark Positive / Negative / Neutral
-- Overall sentiment score 0-10
-KEY TAKEAWAYS: 5 bullet points
-Keep it clear and useful for an intermediate investor.
+# ================================
+# AI ANALYSIS (OpenAI — required)
+# ================================
+def analyze(stock_name: str, sig: dict, bt: dict) -> str:
 """
-print(" Sending to GPT-4...")
-response = client.chat.completions.create(
-model="gpt-4o",
-messages=[{"role": "user", "content": prompt}],
-max_tokens=2000,
+Calls OpenAI to produce a 2-sentence plain-English analysis.
+Raises on failure so the caller (process_stock) can log and skip the stock
+rather than silently swallowing errors.
+"""
+prompt = (
+f"You are a concise stock analyst. Analyse {stock_name} in exactly 2 sentences: "
+f"one for the signal rationale, one for the key risk. Under 60 words total.\n\n"
+f"Signal: {sig['signal']} (score {sig['score']}) | "
+f"Entry ₹{sig['entry']} | SL ₹{sig['sl']} | Target ₹{sig['target']} | "
+f"RSI {sig['rsi']} | BT return {bt['net_return_pct']}% over {bt['trades']} trades."
 )
-return response.choices[0].message.content
-# ═══════════════════════════════════════════════════
-# 8. WHATSAPP
-# ═══════════════════════════════════════════════════
-def send_whatsapp(message):
-if not CALLMEBOT_PHONE or not CALLMEBOT_APIKEY:
-print(" WhatsApp: not configured, skipping")
-return
-try:
-r = requests.get("https://api.callmebot.com/whatsapp.php", params={
-"phone": CALLMEBOT_PHONE,
-"text": message,
-"apikey": CALLMEBOT_APIKEY,
-}, timeout=15)
-print(f" WhatsApp: {'sent' if r.status_code == 200 else 'failed ' +
-str(r.status_code)}")
-time.sleep(5)
-except Exception as e:
-print(f" WhatsApp error: {e}")
-def format_snapshot(name, row, sig, bt):
-emoji = {"STRONG BUY":"🟢🟢","BUY":"🟢","HOLD":"🟡","SELL":"🔴","STRONG
-SELL":"🔴🔴"}.get(sig["signal"],"⚪")
-verdict = interpret_backtest(bt)
-qty = position_size(INITIAL_CAPITAL, sig["entry"], sig["stop_loss"])
-return f"""{emoji} *{name} — {sig['signal']}* ({sig['confidence']}% conf)
-{datetime.now().strftime('%d %b %Y')}
-Price: Rs{row.close:.2f} | RSI: {row.rsi:.1f} | ATR: Rs{sig['atr']}
-Trend: {'Uptrend' if row.close > row.ma200 else 'Downtrend'}
-MACD: {'Bullish crossover!' if (row.macd_hist > 0) else 'Bearish'}
-Entry: Rs{sig['entry']}
-Stop Loss: Rs{sig['stop_loss']}
-Target 1: Rs{sig['target_1']}
-Target 2: Rs{sig['target_2']}
-R/R: {sig['risk_reward']}:1
-Qty (1% risk on Rs1L): {qty} shares
-Backtest: WR {bt.get('win_rate')}% | Sharpe {bt.get('sharpe_ratio')} | DD
-{bt.get('max_drawdown_pct')}%
-{verdict}
-Full AI analysis follows..."""
-def split_message(text, max_len=4000):
-chunks = []
-while len(text) > max_len:
-cut = text.rfind("\n", 0, max_len)
-if cut == -1:
-cut = max_len
-chunks.append(text[:cut])
-text = text[cut:].strip()
-chunks.append(text)
-return chunks
-# ═══════════════════════════════════════════════════
-# 9. MAIN
-# ═══════════════════════════════════════════════════
-def run():
-print(f"\n{'='*55}")
-print(f" Stock Pipeline v4.0 | {datetime.now().strftime('%d %b %Y %H:%M')}")
-print(f"{'='*55}\n")
-obj = login()
-for stock in STOCKS:
-name = stock["name"]
-print(f"\nProcessing {name}...")
-try:
-df = get_data(obj, stock["symbol"], stock["exchange"], days=300)
+client = OpenAI(api_key=OPENAI_API_KEY)
+res = client.chat.completions.create(
+model=OPENAI_MODEL,
+max_tokens=120,
+messages=[{"role": "user", "content": prompt}],
+)
+return res.choices[0].message.content.strip()
+# ================================
+# CONCURRENT PROCESSING (single stock worker)
+# ================================
+def process_stock(obj: SmartConnect, s: dict) -> dict | None:
+"""
+Full pipeline for one stock: fetch → screen → indicators → signal → backtest → AI.
+Returns a result dict or None if the stock should be skipped.
+Intended to run inside a ThreadPoolExecutor worker.
+"""
+time.sleep(FETCH_DELAY) # throttle per-thread to respect API rate limits
+df = get_data(obj, s["symbol"], s["exchange"])
+if df is None:
+return None
+if not passes_volume_screen(df, s["symbol"]):
+return None
 df = add_indicators(df)
-row = df.iloc[-1]
+if df is None:
+return None
 sig = generate_signal(df, len(df) - 1)
-print(f" Signal: {sig['signal']} | Score: {sig['score']} | Conf:
-{sig['confidence']}%")
-print(f" Entry: Rs{sig['entry']} | SL: Rs{sig['stop_loss']} | T1:
-Rs{sig['target_1']}")
 bt = backtest(df)
-if "error" not in bt:
-print(f" Backtest: WR={bt['win_rate']}% | Sharpe={bt['sharpe_ratio']} | PF=
-{bt['profit_factor']} | DD={bt['max_drawdown_pct']}%")
-print(f" Return on Rs1L: Rs{bt['final_capital']:,.0f}
-({bt['total_return_pct']}%)")
-else:
-print(f" Backtest: {bt['error']}")
-bt = {"win_rate":0,"sharpe_ratio":0,"profit_factor":0,"max_drawdown_pct":0,
-"total_trades":0,"avg_hold_days":0,"total_return_pct":0,"final_capital":INITIAL_CAPITAL}
-news = fetch_news(name)
-# WhatsApp snapshot
-send_whatsapp(format_snapshot(name, row, sig, bt))
-# GPT-4 full analysis
-analysis = analyze_with_gpt(name, row, sig, bt, news)
-header = f"AI Analysis — {name}\n{'-'*40}\n"
-chunks = split_message(header + analysis)
-for i, chunk in enumerate(chunks):
-prefix = f"[Part {i+1}/{len(chunks)}]\n" if len(chunks) > 1 else ""
-send_whatsapp(prefix + chunk)
-print(f" Done: {name}")
-except Exception as e:
-print(f" ERROR processing {name}: {e}")
-import traceback
-traceback.print_exc()
-time.sleep(3)
-print(f"\nDone — {len(STOCKS)} stocks processed")
+try:
+analysis = analyze(s["name"], sig, bt)
+except Exception as exc:
+log.error(f"OpenAI analysis failed for {s['name']}: {exc}")
+return None
+log.info(
+f"{s['name']}: {sig['signal']} "
+f"(score {sig['score']}, RSI {sig['rsi']})"
+)
+return {
+"name": s["name"],
+"symbol": s["symbol"],
+"signal": sig["signal"],
+"score": sig["score"],
+"entry": sig["entry"],
+"sl": sig["sl"],
+"target": sig["target"],
+"rsi": sig["rsi"],
+"atr": sig["atr"],
+"bt_return": bt["net_return_pct"],
+"win_rate": bt["win_rate_pct"],
+"analysis": analysis,
+}
+# ================================
+# TOP-N FILTER
+# ================================
+def top_n_signals(results: list[dict], n: int = TOP_N) -> list[dict]:
+"""
+Sort all processed stocks by absolute score (strongest signal first),
+then return the top N. HOLD signals are included only if needed to fill N.
+"""
+# Prioritise BUY/SELL over HOLD, then by |score| descending
+def sort_key(r):
+is_hold = 1 if r["signal"] == "HOLD" else 0
+return (is_hold, -abs(r["score"]))
+sorted_results = sorted(results, key=sort_key)
+return sorted_results[:n]
+# ================================
+# HTML EMAIL
+# ================================
+SIGNAL_COLOR = {"BUY": "#16a34a", "SELL": "#dc2626", "HOLD": "#d97706"}
+SIGNAL_BG = {"BUY": "#f0fdf4", "SELL": "#fef2f2", "HOLD": "#fffbeb"}
+SIGNAL_EMOJI = {"BUY": "▲", "SELL": "▼", "HOLD": "●"}
+def build_html_email(results: list[dict]) -> str:
+date_str = datetime.now().strftime("%A, %d %B %Y")
+rows = ""
+for r in results:
+sig = r["signal"]
+color = SIGNAL_COLOR.get(sig, "#6b7280")
+bg = SIGNAL_BG.get(sig, "#f9fafb")
+emoji = SIGNAL_EMOJI.get(sig, "●")
+rows += f"""
+<tr style="background:{bg}; border-bottom:1px solid #e5e7eb;">
+<td style="padding:14px 16px; font-weight:600; color:#111827;">
+{r['name']}
+<br><span style="font-size:11px; color:#6b7280; font-weight:400;">{r['symbol']}
+</span>
+</td>
+<td style="padding:14px 16px; text-align:center;">
+<span style="
+display:inline-block;
+padding:4px 10px;
+border-radius:9999px;
+background:{color};
+color:#fff;
+font-size:12px;
+font-weight:700;
+letter-spacing:0.05em;
+">{emoji} {sig}</span>
+<br><span style="font-size:11px; color:#6b7280;">score {r['score']}</span>
+</td>
+<td style="padding:14px 16px; text-align:right; font-family:monospace;">
+₹{r['entry']:,.2f}
+</td>
+<td style="padding:14px 16px; text-align:right; font-family:monospace;
+color:#dc2626;">
+₹{r['sl']:,.2f}
+</td>
+<td style="padding:14px 16px; text-align:right; font-family:monospace;
+color:#16a34a;">
+₹{r['target']:,.2f}
+</td>
+<td style="padding:14px 16px; text-align:center; color:#374151;">
+{r['rsi']}
+</td>
+<td style="padding:14px 16px; font-size:12px; color:#374151; max-width:260px;">
+{r['analysis']}
+</td>
+</tr>"""
+html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0; padding:0; background:#f3f4f6; font-family: -apple-system,
+BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+<div style="max-width:900px; margin:32px auto; background:#ffffff; border-radius:12px;
+overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+<!-- Header -->
+<div style="background:#1e3a5f; padding:28px 32px;">
+<h1 style="margin:0; color:#ffffff; font-size:22px; font-weight:700;">
+📈 Daily Portfolio Analysis
+</h1>
+<p style="margin:6px 0 0; color:#93c5fd; font-size:14px;">
+{date_str} &nbsp;·&nbsp; Nifty 50 Universe &nbsp;·&nbsp; Top {len(results)} Signals
+</p>
+</div>
+<!-- Table -->
+<div style="overflow-x:auto; padding:0 0 8px;">
+<table style="width:100%; border-collapse:collapse; font-size:13px;">
+<thead>
+<tr style="background:#f8fafc; border-bottom:2px solid #e2e8f0;">
+<th style="padding:12px 16px; text-align:left; color:#64748b; font-weight:600; texttransform:
+uppercase; font-size:11px; letter-spacing:0.05em;">Stock</th>
+<th style="padding:12px 16px; text-align:center; color:#64748b; font-weight:600;
+text-transform:uppercase; font-size:11px; letter-spacing:0.05em;">Signal</th>
+<th style="padding:12px 16px; text-align:right; color:#64748b; font-weight:600;
+text-transform:uppercase; font-size:11px; letter-spacing:0.05em;">Entry</th>
+<th style="padding:12px 16px; text-align:right; color:#64748b; font-weight:600;
+text-transform:uppercase; font-size:11px; letter-spacing:0.05em;">Stop Loss</th>
+<th style="padding:12px 16px; text-align:right; color:#64748b; font-weight:600;
+text-transform:uppercase; font-size:11px; letter-spacing:0.05em;">Target</th>
+<th style="padding:12px 16px; text-align:center; color:#64748b; font-weight:600;
+text-transform:uppercase; font-size:11px; letter-spacing:0.05em;">RSI</th>
+<th style="padding:12px 16px; text-align:left; color:#64748b; font-weight:600; texttransform:
+uppercase; font-size:11px; letter-spacing:0.05em;">Analysis</th>
+</tr>
+</thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+<!-- Footer -->
+<div style="padding:20px 32px; background:#f8fafc; border-top:1px solid #e5e7eb;">
+<p style="margin:0; font-size:11px; color:#9ca3af; line-height:1.6;">
+⚠️ <strong>Disclaimer:</strong> This report is generated automatically for informational
+purposes only.
+It does not constitute financial advice. Always conduct your own research before making
+investment decisions.
+Past backtest performance does not guarantee future results.
+</p>
+<p style="margin:8px 0 0; font-size:11px; color:#d1d5db;">
+Generated by Stock Pipeline V8 &nbsp;·&nbsp; {datetime.now().strftime("%H:%M IST")}
+</p>
+</div>
+</div>
+</body>
+</html>"""
+return html
+def send_email(results: list[dict]) -> bool:
+"""
+Send the HTML report via Gmail SMTP.
+Uses TLS on port 587. Requires a Gmail App Password (not your account password).
+"""
+try:
+date_str = datetime.now().strftime("%d %b %Y")
+subject = f"📈 Nifty 50 Signals — {date_str} (Top {len(results)})"
+html = build_html_email(results)
+msg = MIMEMultipart("alternative")
+msg["Subject"] = subject
+msg["From"] = GMAIL_SENDER
+msg["To"] = EMAIL_RECIPIENT
+msg.attach(MIMEText(html, "html"))
+with smtplib.SMTP("smtp.gmail.com", 587) as server:
+server.ehlo()
+server.starttls()
+server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+server.sendmail(GMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+log.info(f"Email sent to {EMAIL_RECIPIENT} ✓")
+return True
+except smtplib.SMTPAuthenticationError:
+log.error(
+"Gmail SMTP authentication failed. "
+"Make sure you are using an App Password, not your account password. "
+"Guide: https://support.google.com/accounts/answer/185833"
+)
+return False
+except Exception as exc:
+log.error(f"Email send failed: {exc}")
+return False
+# ================================
+# MAIN
+# ================================
+def run() -> None:
+validate_env()
+obj = login()
+stocks = fetch_nifty50()
+log.info(
+f"Processing {len(stocks)} stocks with {MAX_WORKERS} workers…"
+)
+all_results = []
+# Concurrent fetch + process
+with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+futures = {
+executor.submit(process_stock, obj, s): s for s in stocks
+}
+for future in concurrent.futures.as_completed(futures):
+s = futures[future]
+try:
+result = future.result()
+if result:
+all_results.append(result)
+except Exception as exc:
+log.error(f"Unhandled error processing {s['name']}: {exc}")
+log.info(
+f"Processing complete — {len(all_results)}/{len(stocks)} stocks "
+f"passed screens and generated signals."
+)
+if not all_results:
+log.warning("No results to report — all stocks were skipped.")
+return
+top = top_n_signals(all_results, TOP_N)
+log.info(
+f"Top {len(top)} signals selected: "
++ ", ".join(f"{r['name']} ({r['signal']})" for r in top)
+)
+send_email(top)
+log.info("═" * 40 + " PIPELINE COMPLETE " + "═" * 40)
 if __name__ == "__main__":
 run()
