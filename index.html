@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="theme-color" content="#0a0f1e" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>SignalEdge — Nifty 50</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&family=DM+Sans:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0a0f1e;
+      --surface:   #111827;
+      --border:    rgba(255,255,255,0.07);
+      --text:      #e8eaf0;
+      --muted:     #6b7280;
+      --buy:       #00e5a0;
+      --buy-dim:   rgba(0,229,160,0.10);
+      --sell:      #ff4d6d;
+      --sell-dim:  rgba(255,77,109,0.10);
+      --hold:      #f5a623;
+      --hold-dim:  rgba(245,166,35,0.10);
+      --accent:    #4f8eff;
+    }
+
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'DM Sans', sans-serif;
+      min-height: 100vh;
+      overscroll-behavior: none;
+    }
+
+    /* ── NOISE OVERLAY ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+      pointer-events: none; z-index: 0;
+    }
+
+    /* ── HEADER ── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(10,15,30,0.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 20px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+
+    .logo {
+      font-family: 'Syne', sans-serif;
+      font-weight: 800;
+      font-size: 20px;
+      letter-spacing: -0.5px;
+      color: #fff;
+    }
+    .logo span { color: var(--accent); }
+
+    .header-right {
+      display: flex; align-items: center; gap: 12px;
+    }
+
+    .live-badge {
+      display: flex; align-items: center; gap: 6px;
+      background: rgba(0,229,160,0.1);
+      border: 1px solid rgba(0,229,160,0.2);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      color: var(--buy);
+    }
+    .live-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--buy);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%       { opacity: 0.4; transform: scale(0.8); }
+    }
+
+    .refresh-btn {
+      background: none; border: 1px solid var(--border);
+      color: var(--muted); border-radius: 8px;
+      padding: 6px 10px; cursor: pointer;
+      font-size: 14px; transition: all 0.2s;
+    }
+    .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .refresh-btn.spinning { animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── MAIN ── */
+    main {
+      position: relative; z-index: 1;
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 20px 16px 100px;
+    }
+
+    /* ── DATE BAR ── */
+    .date-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 20px;
+      animation: fadeUp 0.4s ease both;
+    }
+    .date-label {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .date-value {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      color: var(--text);
+    }
+
+    /* ── SUMMARY PILLS ── */
+    .summary {
+      display: flex; gap: 8px;
+      margin-bottom: 24px;
+      animation: fadeUp 0.4s 0.05s ease both;
+    }
+    .pill {
+      flex: 1; text-align: center;
+      padding: 12px 8px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+    .pill.buy  { background: var(--buy-dim);  border-color: rgba(0,229,160,0.2); }
+    .pill.sell { background: var(--sell-dim); border-color: rgba(255,77,109,0.2); }
+    .pill.hold { background: var(--hold-dim); border-color: rgba(245,166,35,0.2); }
+
+    .pill-count {
+      font-family: 'Syne', sans-serif;
+      font-size: 26px; font-weight: 700;
+      line-height: 1;
+    }
+    .pill.buy  .pill-count { color: var(--buy); }
+    .pill.sell .pill-count { color: var(--sell); }
+    .pill.hold .pill-count { color: var(--hold); }
+
+    .pill-label {
+      font-size: 10px; font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-top: 4px;
+    }
+
+    /* ── FILTER TABS ── */
+    .tabs {
+      display: flex; gap: 6px;
+      margin-bottom: 20px;
+      animation: fadeUp 0.4s 0.1s ease both;
+    }
+    .tab {
+      padding: 7px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: none;
+      color: var(--muted);
+      font-size: 12px; font-weight: 500;
+      cursor: pointer; transition: all 0.2s;
+      font-family: 'DM Sans', sans-serif;
+    }
+    .tab.active, .tab:hover { border-color: var(--accent); color: var(--accent); background: rgba(79,142,255,0.08); }
+    .tab.active { font-weight: 600; }
+
+    /* ── SIGNAL CARDS ── */
+    .cards { display: flex; flex-direction: column; gap: 12px; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      cursor: pointer;
+      transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
+      animation: fadeUp 0.4s ease both;
+      position: relative; overflow: hidden;
+    }
+    .card::before {
+      content: '';
+      position: absolute; left: 0; top: 0; bottom: 0;
+      width: 3px;
+      border-radius: 3px 0 0 3px;
+    }
+    .card.BUY  { border-color: rgba(0,229,160,0.15); }
+    .card.BUY::before  { background: var(--buy); }
+    .card.SELL { border-color: rgba(255,77,109,0.15); }
+    .card.SELL::before { background: var(--sell); }
+    .card.HOLD { border-color: rgba(245,166,35,0.15); }
+    .card.HOLD::before { background: var(--hold); }
+
+    .card:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
+    .card:active { transform: scale(0.98); }
+
+    .card-top {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      margin-bottom: 14px;
+    }
+
+    .stock-name {
+      font-family: 'Syne', sans-serif;
+      font-size: 16px; font-weight: 700;
+      color: #fff; line-height: 1.2;
+    }
+    .stock-symbol {
+      font-family: 'DM Mono', monospace;
+      font-size: 10px; color: var(--muted);
+      margin-top: 2px;
+    }
+
+    .signal-badge {
+      display: flex; align-items: center; gap: 5px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-family: 'Syne', sans-serif;
+      font-size: 11px; font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+    .signal-badge.BUY  { background: var(--buy-dim);  color: var(--buy);  border: 1px solid rgba(0,229,160,0.3); }
+    .signal-badge.SELL { background: var(--sell-dim); color: var(--sell); border: 1px solid rgba(255,77,109,0.3); }
+    .signal-badge.HOLD { background: var(--hold-dim); color: var(--hold); border: 1px solid rgba(245,166,35,0.3); }
+
+    .card-metrics {
+      display: grid; grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+
+    .metric { }
+    .metric-label {
+      font-size: 9px; font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.1em;
+      margin-bottom: 3px;
+    }
+    .metric-value {
+      font-family: 'DM Mono', monospace;
+      font-size: 13px; color: var(--text);
+    }
+    .metric-value.entry { color: #fff; font-weight: 500; }
+    .metric-value.sl    { color: var(--sell); }
+    .metric-value.tgt   { color: var(--buy); }
+
+    .card-footer {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+    .rsi-bar-wrap {
+      display: flex; align-items: center; gap: 8px; flex: 1;
+    }
+    .rsi-label {
+      font-family: 'DM Mono', monospace;
+      font-size: 10px; color: var(--muted);
+    }
+    .rsi-bar {
+      flex: 1; height: 3px;
+      background: rgba(255,255,255,0.08);
+      border-radius: 999px; overflow: hidden;
+    }
+    .rsi-fill {
+      height: 100%; border-radius: 999px;
+      transition: width 0.6s ease;
+    }
+    .rsi-value {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px; color: var(--text);
+      min-width: 32px; text-align: right;
+    }
+
+    .score-chip {
+      font-family: 'DM Mono', monospace;
+      font-size: 10px; color: var(--muted);
+      background: rgba(255,255,255,0.05);
+      padding: 3px 7px; border-radius: 6px;
+      margin-left: 10px;
+    }
+
+    /* ── EMPTY STATE ── */
+    .empty {
+      text-align: center; padding: 60px 20px;
+      color: var(--muted);
+      animation: fadeUp 0.4s ease both;
+    }
+    .empty-icon { font-size: 40px; margin-bottom: 12px; }
+    .empty-title { font-family: 'Syne', sans-serif; font-size: 18px; color: var(--text); margin-bottom: 6px; }
+    .empty-sub { font-size: 13px; }
+
+    /* ── BOTTOM NAV ── */
+    nav {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(10,15,30,0.92);
+      backdrop-filter: blur(20px);
+      border-top: 1px solid var(--border);
+      display: flex;
+      max-width: 480px; margin: 0 auto;
+    }
+    .nav-item {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      padding: 10px 0 14px;
+      cursor: pointer; border: none; background: none;
+      color: var(--muted); font-size: 10px; font-weight: 500;
+      font-family: 'DM Sans', sans-serif;
+      transition: color 0.2s; gap: 4px;
+    }
+    .nav-item.active { color: var(--accent); }
+    .nav-icon { font-size: 20px; line-height: 1; }
+
+    /* ── MODAL ── */
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 200;
+      background: rgba(0,0,0,0.7);
+      backdrop-filter: blur(6px);
+      display: flex; align-items: flex-end;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.3s;
+    }
+    .modal-overlay.open { opacity: 1; pointer-events: all; }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 24px 24px 0 0;
+      width: 100%; max-width: 480px;
+      margin: 0 auto;
+      padding: 20px 24px 40px;
+      transform: translateY(40px);
+      transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1);
+    }
+    .modal-overlay.open .modal { transform: translateY(0); }
+
+    .modal-handle {
+      width: 36px; height: 4px;
+      background: var(--border); border-radius: 999px;
+      margin: 0 auto 20px;
+    }
+    .modal-title {
+      font-family: 'Syne', sans-serif;
+      font-size: 22px; font-weight: 800;
+      color: #fff; margin-bottom: 4px;
+    }
+    .modal-symbol {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px; color: var(--muted); margin-bottom: 20px;
+    }
+    .modal-signal {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 14px; border-radius: 999px;
+      font-family: 'Syne', sans-serif;
+      font-size: 13px; font-weight: 700;
+      margin-bottom: 24px;
+    }
+    .modal-grid {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 12px; margin-bottom: 20px;
+    }
+    .modal-metric {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: 12px; padding: 12px 14px;
+    }
+    .modal-metric-label {
+      font-size: 10px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.1em;
+      margin-bottom: 4px;
+    }
+    .modal-metric-value {
+      font-family: 'DM Mono', monospace;
+      font-size: 16px; color: var(--text); font-weight: 500;
+    }
+    .modal-close {
+      width: 100%; padding: 14px;
+      background: rgba(79,142,255,0.1);
+      border: 1px solid rgba(79,142,255,0.2);
+      border-radius: 12px; color: var(--accent);
+      font-family: 'Syne', sans-serif;
+      font-size: 14px; font-weight: 700;
+      cursor: pointer; transition: all 0.2s;
+    }
+    .modal-close:hover { background: rgba(79,142,255,0.2); }
+
+    /* ── RUN PIPELINE BUTTON ── */
+    .run-btn {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: calc(100% - 32px);
+      margin: 0 16px 16px;
+      padding: 14px;
+      background: linear-gradient(135deg, #1a3a6b, #1e4d9b);
+      border: 1px solid rgba(79,142,255,0.3);
+      border-radius: 14px;
+      color: #fff;
+      font-family: 'Syne', sans-serif;
+      font-size: 15px; font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s;
+      position: relative; overflow: hidden;
+    }
+    .run-btn:hover { background: linear-gradient(135deg, #1e4d9b, #2563eb); transform: translateY(-1px); }
+    .run-btn:active { transform: scale(0.98); }
+    .run-btn.running {
+      background: linear-gradient(135deg, #1a3a2a, #166534);
+      border-color: rgba(0,229,160,0.3);
+      pointer-events: none;
+    }
+    .run-btn.error {
+      background: linear-gradient(135deg, #3a1a1a, #7f1d1d);
+      border-color: rgba(255,77,109,0.3);
+    }
+    .run-btn-icon { font-size: 18px; }
+    .run-status {
+      margin: 0 16px 12px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      display: none;
+    }
+    .run-status.show { display: block; }
+    .run-status.running { background: rgba(0,229,160,0.08); color: var(--buy); border: 1px solid rgba(0,229,160,0.2); }
+    .run-status.error   { background: rgba(255,77,109,0.08); color: var(--sell); border: 1px solid rgba(255,77,109,0.2); }
+    .run-status.done    { background: rgba(79,142,255,0.08); color: var(--accent); border: 1px solid rgba(79,142,255,0.2); }
+
+    /* ── ANIMATIONS ── */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(16px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── LOADING ── */
+    .skeleton {
+      background: linear-gradient(90deg, var(--surface) 25%, rgba(255,255,255,0.04) 50%, var(--surface) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.4s infinite;
+      border-radius: 12px;
+    }
+    @keyframes shimmer {
+      0%   { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    .skeleton-card { height: 130px; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">Signal<span>Edge</span></div>
+  <div class="header-right">
+    <div class="live-badge"><div class="live-dot"></div>MOCK</div>
+    <button class="refresh-btn" id="refreshBtn" title="Refresh">↻</button>
+  </div>
+</header>
+
+<!-- MAIN -->
+<main>
+  <div class="date-bar">
+    <span class="date-label">Nifty 50 · Daily Signals</span>
+    <span class="date-value" id="dateDisplay"></span>
+  </div>
+
+  <!-- Summary pills -->
+  <div class="summary">
+    <div class="pill buy">
+      <div class="pill-count" id="buyCount">0</div>
+      <div class="pill-label">▲ Buy</div>
+    </div>
+    <div class="pill sell">
+      <div class="pill-count" id="sellCount">0</div>
+      <div class="pill-label">▼ Sell</div>
+    </div>
+    <div class="pill hold">
+      <div class="pill-count" id="holdCount">0</div>
+      <div class="pill-label">● Hold</div>
+    </div>
+  </div>
+
+  <!-- Run Pipeline -->
+  <button class="run-btn" id="runBtn">
+    <span class="run-btn-icon">⚡</span>
+    <span id="runBtnText">Run Pipeline Now</span>
+  </button>
+  <div class="run-status" id="runStatus"></div>
+
+  <!-- Filter tabs -->
+  <div class="tabs">
+    <button class="tab active" data-filter="ALL">All</button>
+    <button class="tab" data-filter="BUY">Buy</button>
+    <button class="tab" data-filter="SELL">Sell</button>
+    <button class="tab" data-filter="HOLD">Hold</button>
+  </div>
+
+  <!-- Cards -->
+  <div class="cards" id="cardsContainer"></div>
+</main>
+
+<!-- BOTTOM NAV -->
+<nav>
+  <button class="nav-item active">
+    <span class="nav-icon">📊</span>Signals
+  </button>
+  <button class="nav-item">
+    <span class="nav-icon">📈</span>Chart
+  </button>
+  <button class="nav-item">
+    <span class="nav-icon">🔔</span>Alerts
+  </button>
+  <button class="nav-item">
+    <span class="nav-icon">⚙️</span>Settings
+  </button>
+</nav>
+
+<!-- DETAIL MODAL -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="modalName"></div>
+    <div class="modal-symbol" id="modalSymbol"></div>
+    <div class="modal-signal" id="modalSignal"></div>
+    <div class="modal-grid" id="modalGrid"></div>
+    <button class="modal-close" id="modalClose">Close</button>
+  </div>
+</div>
+
+<script>
+  // ── CONFIG ──
+  const API_BASE = "https://portfolio-analyser-production.up.railway.app";
+
+  let currentFilter = "ALL";
+  let signals = [];
+  let lastRunTime = null;
+
+  // ── UTILS ──
+  function fmt(n) {
+    return "\u20B9" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function rsiColor(rsi) {
+    if (rsi >= 70) return "var(--sell)";
+    if (rsi <= 30) return "var(--buy)";
+    return "var(--accent)";
+  }
+
+  function signalIcon(s) {
+    return s === "BUY" ? "\u25B2" : s === "SELL" ? "\u25BC" : "\u25CF";
+  }
+
+  function signalColor(s) {
+    return s === "BUY" ? "var(--buy)" : s === "SELL" ? "var(--sell)" : "var(--hold)";
+  }
+
+  function signalDim(s) {
+    return s === "BUY" ? "var(--buy-dim)" : s === "SELL" ? "var(--sell-dim)" : "var(--hold-dim)";
+  }
+
+  function formatLastRun(iso) {
+    if (!iso) return null;
+    const d = new Date(iso);
+    return d.toLocaleTimeString("en-IN", { hour:"2-digit", minute:"2-digit" }) +
+           " \u00B7 " + d.toLocaleDateString("en-IN", { day:"2-digit", month:"short" });
+  }
+
+  // ── DATE ──
+  function setDate() {
+    const now = new Date();
+    document.getElementById("dateDisplay").textContent =
+      now.toLocaleDateString("en-IN", { day:"2-digit", month:"short", year:"numeric" });
+  }
+
+  // ── RENDER ──
+  function renderSummary(data) {
+    document.getElementById("buyCount").textContent  = data.filter(r => r.signal === "BUY").length;
+    document.getElementById("sellCount").textContent = data.filter(r => r.signal === "SELL").length;
+    document.getElementById("holdCount").textContent = data.filter(r => r.signal === "HOLD").length;
+  }
+
+  function renderCards(data) {
+    const container = document.getElementById("cardsContainer");
+    const filtered  = currentFilter === "ALL" ? data : data.filter(r => r.signal === currentFilter);
+
+    if (!filtered.length) {
+      container.innerHTML = `
+        <div class="empty">
+          <div class="empty-icon">\uD83D\uDD0D</div>
+          <div class="empty-title">No signals</div>
+          <div class="empty-sub">No ${currentFilter.toLowerCase()} signals today.</div>
+        </div>`;
+      return;
+    }
+
+    container.innerHTML = filtered.map((r, i) => {
+      const hasAnalysis = r.analysis && r.analysis !== "HOLD \u2014 no actionable signal.";
+      return `
+      <div class="card ${r.signal}" style="animation-delay:${i * 0.05}s" data-idx="${data.indexOf(r)}">
+        <div class="card-top">
+          <div>
+            <div class="stock-name">${r.name}</div>
+            <div class="stock-symbol">${r.symbol}</div>
+          </div>
+          <div class="signal-badge ${r.signal}">${signalIcon(r.signal)} ${r.signal}</div>
+        </div>
+        <div class="card-metrics">
+          <div class="metric">
+            <div class="metric-label">Entry</div>
+            <div class="metric-value entry">${fmt(r.entry)}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Stop Loss</div>
+            <div class="metric-value sl">${fmt(r.sl)}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Target</div>
+            <div class="metric-value tgt">${fmt(r.target)}</div>
+          </div>
+        </div>
+        ${hasAnalysis ? `<div style="margin-top:10px;padding:8px 10px;background:rgba(255,255,255,0.03);border-radius:8px;font-size:11px;color:var(--muted);line-height:1.5;">${r.analysis}</div>` : ""}
+        <div class="card-footer">
+          <div class="rsi-bar-wrap">
+            <span class="rsi-label">RSI</span>
+            <div class="rsi-bar">
+              <div class="rsi-fill" style="width:${r.rsi}%;background:${rsiColor(r.rsi)}"></div>
+            </div>
+            <span class="rsi-value">${r.rsi}</span>
+          </div>
+          <div class="score-chip">score ${r.score > 0 ? "+" : ""}${r.score}</div>
+        </div>
+      </div>`;
+    }).join("");
+
+    container.querySelectorAll(".card").forEach(card => {
+      card.addEventListener("click", () => openModal(data[+card.dataset.idx]));
+    });
+  }
+
+  // ── MODAL ──
+  function openModal(r) {
+    const overlay = document.getElementById("modalOverlay");
+    document.getElementById("modalName").textContent   = r.name;
+    document.getElementById("modalSymbol").textContent = r.symbol;
+
+    const sig = document.getElementById("modalSignal");
+    sig.textContent = signalIcon(r.signal) + " " + r.signal;
+    sig.style.background = signalDim(r.signal);
+    sig.style.color       = signalColor(r.signal);
+    sig.style.border      = "1px solid " + signalColor(r.signal) + "44";
+
+    const rR = ((r.target - r.entry) / (r.entry - r.sl)).toFixed(1);
+    const hasAnalysis = r.analysis && r.analysis !== "HOLD \u2014 no actionable signal.";
+
+    document.getElementById("modalGrid").innerHTML = `
+      <div class="modal-metric">
+        <div class="modal-metric-label">Entry</div>
+        <div class="modal-metric-value">${fmt(r.entry)}</div>
+      </div>
+      <div class="modal-metric">
+        <div class="modal-metric-label">Stop Loss</div>
+        <div class="modal-metric-value" style="color:var(--sell)">${fmt(r.sl)}</div>
+      </div>
+      <div class="modal-metric">
+        <div class="modal-metric-label">Target</div>
+        <div class="modal-metric-value" style="color:var(--buy)">${fmt(r.target)}</div>
+      </div>
+      <div class="modal-metric">
+        <div class="modal-metric-label">ATR</div>
+        <div class="modal-metric-value">${r.atr}</div>
+      </div>
+      <div class="modal-metric">
+        <div class="modal-metric-label">RSI (14)</div>
+        <div class="modal-metric-value" style="color:${rsiColor(r.rsi)}">${r.rsi}</div>
+      </div>
+      <div class="modal-metric">
+        <div class="modal-metric-label">R:R Ratio</div>
+        <div class="modal-metric-value">${rR}x</div>
+      </div>
+      <div class="modal-metric">
+        <div class="modal-metric-label">BT Return</div>
+        <div class="modal-metric-value" style="color:${r.bt_return >= 0 ? "var(--buy)" : "var(--sell)"}">${r.bt_return >= 0 ? "+" : ""}${r.bt_return}%</div>
+      </div>
+      <div class="modal-metric">
+        <div class="modal-metric-label">Win Rate</div>
+        <div class="modal-metric-value">${r.win_rate}%</div>
+      </div>
+      ${hasAnalysis ? `<div style="grid-column:1/-1;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:12px;padding:12px 14px;"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px;">AI Analysis</div><div style="font-size:12px;color:var(--text);line-height:1.6;">${r.analysis}</div></div>` : ""}
+    `;
+
+    overlay.classList.add("open");
+  }
+
+  function closeModal() {
+    document.getElementById("modalOverlay").classList.remove("open");
+  }
+
+  document.getElementById("modalClose").addEventListener("click", closeModal);
+  document.getElementById("modalOverlay").addEventListener("click", e => {
+    if (e.target === document.getElementById("modalOverlay")) closeModal();
+  });
+
+  // ── LOADING ──
+  function showSkeletons() {
+    const c = document.getElementById("cardsContainer");
+    c.innerHTML = Array(5).fill('<div class="skeleton skeleton-card"></div>').join("");
+  }
+
+  // ── REFRESH — live API ──
+  async function loadData() {
+    const btn = document.getElementById("refreshBtn");
+    btn.classList.add("spinning");
+    showSkeletons();
+
+    try {
+      const resp = await fetch(API_BASE + "/signals");
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const data = await resp.json();
+
+      signals = (data.signals || []).sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
+      lastRunTime = data.last_run;
+
+      const badge = document.querySelector(".live-badge");
+      if (lastRunTime) {
+        badge.innerHTML = '<div class="live-dot"></div>LIVE \u00B7 ' + formatLastRun(lastRunTime);
+      } else {
+        badge.innerHTML = '<div class="live-dot"></div>NO DATA YET';
+      }
+
+      renderSummary(signals);
+      renderCards(signals);
+
+    } catch (err) {
+      document.getElementById("cardsContainer").innerHTML = `
+        <div class="empty">
+          <div class="empty-icon">\u26A0\uFE0F</div>
+          <div class="empty-title">Could not load signals</div>
+          <div class="empty-sub">${err.message} \u2014 tap \u21BB to retry</div>
+        </div>`;
+    }
+
+    btn.classList.remove("spinning");
+  }
+
+  document.getElementById("refreshBtn").addEventListener("click", loadData);
+
+  // ── RUN PIPELINE ──
+  let pollInterval = null;
+
+  function setRunStatus(type, msg) {
+    const el = document.getElementById("runStatus");
+    el.textContent = msg;
+    el.className = "run-status show " + type;
+  }
+
+  function startPolling() {
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(async () => {
+      try {
+        const resp = await fetch(API_BASE + "/status");
+        const data = await resp.json();
+        if (data.status === "done") {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          const btn = document.getElementById("runBtn");
+          btn.classList.remove("running");
+          document.getElementById("runBtnText").textContent = "Run Pipeline Now";
+          setRunStatus("done", "\u2713 Pipeline complete \u2014 refreshing signals\u2026");
+          setTimeout(() => loadData(), 1500);
+        } else if (data.status === "error") {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          const btn = document.getElementById("runBtn");
+          btn.classList.remove("running");
+          btn.classList.add("error");
+          document.getElementById("runBtnText").textContent = "Pipeline Failed \u2014 Tap to Retry";
+          setRunStatus("error", "\u2717 Error: " + (data.error || "Unknown error"));
+        }
+      } catch (e) { /* keep polling */ }
+    }, 5000);
+  }
+
+  document.getElementById("runBtn").addEventListener("click", async () => {
+    const btn = document.getElementById("runBtn");
+    btn.classList.remove("error");
+    btn.classList.add("running");
+    document.getElementById("runBtnText").textContent = "Pipeline Running\u2026";
+    setRunStatus("running", "\u26A1 Scanning 50 Nifty stocks \u2014 this takes ~5 mins. Stay tuned!");
+
+    try {
+      const resp = await fetch(API_BASE + "/run", { method: "POST" });
+      if (resp.status === 202) {
+        startPolling();
+      } else {
+        throw new Error("Unexpected status " + resp.status);
+      }
+    } catch (err) {
+      btn.classList.remove("running");
+      btn.classList.add("error");
+      document.getElementById("runBtnText").textContent = "Failed \u2014 Tap to Retry";
+      setRunStatus("error", "\u2717 Could not reach API: " + err.message);
+    }
+  });
+
+  // ── FILTER TABS ──
+  document.querySelectorAll(".tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      currentFilter = tab.dataset.filter;
+      renderCards(signals);
+    });
+  });
+
+  // ── INIT ──
+  setDate();
+  loadData();
+</script>
+</body>
+</html>
